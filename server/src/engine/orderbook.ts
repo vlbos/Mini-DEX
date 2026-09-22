@@ -188,4 +188,24 @@ export class OrderBook {
     private sideOf(side: Side): { book: Map<bigint, Level>; prices: bigint[] } {
         return side === "buy" ? { book: this.bids, prices: this.bidPrices } : { book: this.asks, prices: this.askPrices };
     }
+
+/**
+ * 从 SQLite 恢复一个尚未成交完成的订单。
+ *
+ * 注意：
+ * 这里不能调用 submit()。
+ * submit() 会重新执行撮合。
+ */
+restore(order: Order): void {
+    if (this.byId.has(order.id)) {
+        return;
+    }
+
+    this.seq = Math.max(
+        this.seq,
+        order.seq,
+    );
+
+    this.rest(order);
+}
 }

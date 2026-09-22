@@ -5,7 +5,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import type { Server } from "node:http";
 import type { Hex } from "viem";
-import { OrderBook } from "./engine/orderbook.js";
+import { MatchingService } from "./matchingService.js";
 import { Ledger } from "./ledger.js";
 import { createAuth } from "./auth.js";
 import { createChain } from "./chain.js";
@@ -40,7 +40,11 @@ const config = {
 };
 
 const ledger = new Ledger();
-const book = new OrderBook();
+
+const matching =
+  new MatchingService(ledger);
+
+const book = matching.book;
 const auth = createAuth({ chainId: CHAIN_ID, jwtSecret: JWT_SECRET });
 const chain = createChain({
   chainId: CHAIN_ID,
@@ -57,10 +61,16 @@ app.route("/", auth.router);
 // routes 需要 ws，ws 需要 http server，所以先占个位，server 起来后再填
 let hub: ReturnType<typeof createWs> | null = null;
 const routes = createRoutes({
-  ledger, book, chain, bearer: auth.bearer, config,
+  ledger,
+  matching,
+  chain,
+  bearer: auth.bearer,
+  config,
   ws: {
-    broadcast: (t, d) => hub?.broadcast(t, d),
-    sendBalance: (a, d) => hub?.sendBalance(a, d),
+    broadcast: (t, d) =>
+      hub?.broadcast(t, d),
+    sendBalance: (a, d) =>
+      hub?.sendBalance(a, d),
   },
 });
 app.route("/", routes.app);

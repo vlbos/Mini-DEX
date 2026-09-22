@@ -15,3 +15,6 @@ contracts/broadcast/
 
 # 日志
 *.log
+server/data/*.sqlite
+server/data/*.sqlite-shm
+server/data/*.sqlite-wal
