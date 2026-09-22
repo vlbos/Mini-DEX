@@ -36,10 +36,69 @@ contract VaultTest is Test {
 
         vault.setAllowedToken(address(usdc), true);
         vault.setAllowedToken(address(wavax), true);
-
+        vault.setMaxBalance(address(usdc), 1_000e6);
+        vault.setMaxBalance(address(wavax), 10e18);
         usdc.mint(alice, 1_000e6);
         vm.prank(alice);
         usdc.approve(address(vault), type(uint256).max);
+    }
+
+    //低于上限成功
+    function test_Deposit_BelowMaxBalance() public {
+        vault.setMaxBalance(address(usdc), 1_000e6);
+
+        _depositAlice(500e6);
+
+        assertEq(vault.balances(alice, address(usdc)), 500e6);
+    }
+
+    // 刚好达到上限成功
+    function test_Deposit_AtMaxBalance() public {
+        vault.setMaxBalance(address(usdc), 1_000e6);
+
+        _depositAlice(1_000e6);
+
+        assertEq(vault.balances(alice, address(usdc)), 1_000e6);
+    }
+
+    //超过上限直接 revert
+    function test_RevertWhen_Deposit_ExceedsMaxBalance() public {
+        vault.setMaxBalance(address(usdc), 1_000e6);
+
+        _depositAlice(900e6);
+
+        vm.prank(alice);
+        vm.expectRevert("Vault: max balance exceeded");
+        vault.deposit(address(usdc), 100e6 + 1);
+    }
+
+    //提现以后可以重新存入
+    function test_Deposit_AfterWithdraw_CanUseReleasedLimit() public {
+        vault.setMaxBalance(address(usdc), 1_000e6);
+
+        _depositAlice(1_000e6);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _sign(SIGNER_PK, alice, address(usdc), 400e6, 1, deadline);
+
+        vm.prank(alice);
+        vault.withdraw(address(usdc), 400e6, 1, deadline, sig);
+
+        assertEq(vault.balances(alice, address(usdc)), 600e6);
+
+        // 释放出的 400 USDC 空间可以再次充值
+        _depositAlice(400e6);
+
+        assertEq(vault.balances(alice, address(usdc)), 1_000e6);
+    }
+
+    //管理员权限测试
+    function test_RevertWhen_SetMaxBalance_NotOwner() public {
+        vm.prank(alice);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+
+        vault.setMaxBalance(address(usdc), 1_000e6);
     }
 
     // ---------- helpers ----------
@@ -226,7 +285,9 @@ contract VaultTest is Test {
             )
         );
         bytes32 structHash = keccak256(
-            abi.encode(vault.WITHDRAW_TYPEHASH(), alice, address(usdc), uint256(123), uint256(9), uint256(1_800_000_000))
+            abi.encode(
+                vault.WITHDRAW_TYPEHASH(), alice, address(usdc), uint256(123), uint256(9), uint256(1_800_000_000)
+            )
         );
         bytes32 expected = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
 

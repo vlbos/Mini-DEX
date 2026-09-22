@@ -34,7 +34,10 @@ contract Vault is EIP712, Ownable, ReentrancyGuard {
 
     /// @notice 已用过的提现 nonce，防止同一条授权被重复使用（重放攻击）
     mapping(uint256 => bool) public usedNonces;
+    /// @notice 每种 token 的单用户最大链上余额
+    mapping(address => uint256) public maxBalance;
 
+    event MaxBalanceUpdated(address indexed token, uint256 maxBalance);
     event Deposit(address indexed user, address indexed token, uint256 amount);
     event Withdraw(address indexed user, address indexed token, uint256 amount, uint256 nonce);
 
@@ -60,6 +63,15 @@ contract Vault is EIP712, Ownable, ReentrancyGuard {
         allowedTokens[token] = allowed;
     }
 
+    function setMaxBalance(address token, uint256 maxAmount) external onlyOwner {
+        require(token != address(0), "Vault: token is zero");
+        require(maxAmount > 0, "Vault: max balance is zero");
+
+        maxBalance[token] = maxAmount;
+
+        emit MaxBalanceUpdated(token, maxAmount);
+    }
+
     // ------------------------------------------------------------------
     // 用户
     // ------------------------------------------------------------------
@@ -70,8 +82,12 @@ contract Vault is EIP712, Ownable, ReentrancyGuard {
         require(allowedTokens[token], "Vault: token not allowed");
         require(amount > 0, "Vault: amount is zero");
 
+        uint256 newBalance = balances[msg.sender][token] + amount;
+
+        require(newBalance <= maxBalance[token], "Vault: max balance exceeded");
+
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        balances[msg.sender][token] += amount;
+        balances[msg.sender][token] = newBalance;
 
         emit Deposit(msg.sender, token, amount);
     }
