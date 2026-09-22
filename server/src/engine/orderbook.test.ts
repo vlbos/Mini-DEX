@@ -62,7 +62,49 @@ describe("OrderBook", () => {
     expect(r.fills[0]!.makerOrderId).toBe(first.id);
     expect(r.fills[0]!.maker).toBe("a");
   });
+  it("拒绝 self-trade：同一账户不能与自己的订单成交", () => {
+    const ob = new OrderBook();
 
+    // Alice 先挂卖单
+    const aliceSell = ob.submit(
+      limit("alice", "sell", "100", "1"),
+    ).resting!;
+
+    // Alice 自己买入，不能与自己的卖单成交
+    const r = ob.submit(
+      limit("alice", "buy", "100", "1"),
+    );
+
+    expect(r.fills).toHaveLength(0);
+    expect(r.resting?.remaining).toBe(F("1"));
+
+    // Alice 原来的卖单仍然存在
+    expect(ob.get(aliceSell.id)?.remaining).toBe(F("1"));
+
+    // 买单也应该挂在买方
+    expect(ob.bestBid()).toBe(F("100"));
+    expect(ob.bestAsk()).toBe(F("100"));
+  });
+  it("self-trade 后继续寻找其他账户的 maker", () => {
+    const ob = new OrderBook();
+
+    // Alice 和 Bob 都在 100 价卖出
+    ob.submit(limit("alice", "sell", "100", "1"));
+    const bobSell = ob.submit(
+      limit("bob", "sell", "100", "1"),
+    ).resting!;
+
+    // Alice 买入，应该跳过自己的卖单，然后吃 Bob 的卖单
+    const r = ob.submit(
+      limit("alice", "buy", "100", "1"),
+    );
+
+    expect(r.fills).toHaveLength(1);
+    expect(r.fills[0]!.maker).toBe("bob");
+    expect(r.fills[0]!.taker).toBe("alice");
+    expect(r.fills[0]!.makerOrderId).toBe(bobSell.id);
+    expect(r.fills[0]!.qty).toBe(F("1"));
+  });
   it("market 买单：吃穿多个档位", () => {
     const ob = new OrderBook();
     ob.submit(limit("a", "sell", "100", "1"));
