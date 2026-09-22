@@ -10,7 +10,12 @@ const dataDir = path.resolve(__dirname, "../../data");
 
 fs.mkdirSync(dataDir, { recursive: true });
 
-const dbPath = path.join(dataDir, "minidex.sqlite");
+const dbFile =
+    process.env.NODE_ENV === "test"
+        ? "minidex.test.sqlite"
+        : "minidex.sqlite";
+
+const dbPath = path.join(dataDir, dbFile);
 
 const db = new Database(dbPath);
 

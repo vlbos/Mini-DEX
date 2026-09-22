@@ -1,467 +1,420 @@
 import {
-  OrderBook,
-  type Order,
-  type Fill,
-  type Side,
-  type OrderType,
+    OrderBook,
+    type Order,
+    type Fill,
+    type Side,
+    type OrderType,
 } from "./engine/orderbook.js";
 
 import type { Ledger } from "./ledger.js";
 
 import {
-  loadOpenOrders,
-  saveOrder,
-  deleteOrder,
+    loadOpenOrders,
+    saveOrder,
+    deleteOrder,
 } from "./db/orderRepository.js";
 
 import { saveTrade } from "./db/tradeRepository.js";
 
 import {
-  mulFixed,
+    mulFixed,
 } from "./fixed.js";
+export type PrivateOrderEvent =
+    | "order.accepted"
+    | "order.partially_filled"
+    | "order.filled"
+    | "order.cancelled"
+    | "order.rejected";
 
+export interface PrivateOrderEventPayload {
+    order: Order;
+    fill?: {
+        price: bigint;
+        qty: bigint;
+    };
+}
+
+export type PrivateOrderEventHandler = (
+    owner: string,
+    type: PrivateOrderEvent,
+    payload: PrivateOrderEventPayload,
+) => void;
 export interface PlaceInput {
-  id: string;
-  owner: string;
-  side: Side;
-  type: OrderType;
-  price: bigint;
-  qty: bigint;
-  ts?: number;
+    id: string;
+    owner: string;
+    side: Side;
+    type: OrderType;
+    price: bigint;
+    qty: bigint;
+    ts?: number;
 }
 
 export class MatchingService {
-  readonly book: OrderBook;
+    readonly book: OrderBook;
 
-  constructor(
-    private readonly ledger: Ledger,
-  ) {
-    this.book = new OrderBook();
+    private privateOrderEventHandler:
+        | PrivateOrderEventHandler
+        | undefined;
 
-    this.restoreOrders();
-  }
-
-  /**
-   * SQLite -> OrderBook
-   *
-   * 这里只恢复 open orders，
-   * 不重新撮合。
-   */
-  private restoreOrders(): void {
-    const orders = loadOpenOrders();
-
-    for (const order of orders) {
-      this.book.restore(order);
+    constructor(private readonly ledger: Ledger) {
+        this.book = new OrderBook();
+        this.restoreOrders();
     }
 
-    console.log(
-      `[db] restored ${orders.length} open orders`,
-    );
-  }
-
-  ordersOf(owner: string): Order[] {
-    return this.book.ordersOf(
-      owner.toLowerCase(),
-    );
-  }
-
-  getOrder(id: string): Order | undefined {
-    return this.book.get(id);
-  }
-
-  /**
-   * 估算 market buy 最少需要多少 USDC。
-   */
-  private estimateBuyCost(qty: bigint): bigint {
-    let cost = 0n;
-    let left = qty;
-
-    const snapshot =
-      this.book.snapshot(
-        Number.MAX_SAFE_INTEGER,
-      );
-
-    for (const [price, levelQty] of snapshot.asks) {
-      const take =
-        left < levelQty
-          ? left
-          : levelQty;
-
-      cost += mulFixed(
-        price,
-        take,
-      );
-
-      left -= take;
-
-      if (left === 0n) break;
+    setPrivateOrderEventHandler(
+        handler: PrivateOrderEventHandler,
+    ): void {
+        this.privateOrderEventHandler = handler;
     }
 
-    return cost;
-  }
-
-  /**
-   * 下单：
-   *
-   * 1. 冻结
-   * 2. 撮合
-   * 3. 成交结算
-   * 4. 更新 SQLite
-   * 5. 处理剩余冻结
-   */
-  placeOrder(
-    input: PlaceInput,
-  ) {
-    const owner =
-      input.owner.toLowerCase();
-
-    const lockAsset =
-      input.side === "buy"
-        ? "USDC"
-        : "WAVAX";
-
-    let lockAmount: bigint;
-
-    /**
-     * sell：
-     * WAVAX qty
-     */
-    if (input.side === "sell") {
-      lockAmount = input.qty;
-    }
-
-    /**
-     * limit buy：
-     * price * qty
-     */
-    else if (input.type === "limit") {
-      lockAmount =
-        mulFixed(
-          input.price,
-          input.qty,
-        );
-    }
-
-    /**
-     * market buy：
-     * 先冻结全部 USDC available。
-     */
-    else {
-      const available =
-        this.ledger.get(owner)
-          .USDC.available;
-
-      const estimated =
-        this.estimateBuyCost(
-          input.qty,
-        );
-
-      if (estimated > available) {
-        throw new Error(
-          "余额不足: USDC 不够买这么多",
-        );
-      }
-
-      lockAmount = available;
-    }
-
-    /**
-     * 1. 冻结
-     */
-    this.ledger.lock(
-      owner,
-      lockAsset,
-      lockAmount,
-    );
-
-    let result;
-
-    try {
-      /**
-       * 2. 撮合
-       */
-      result =
-        this.book.submit({
-          id: input.id,
-          owner,
-          side: input.side,
-          type: input.type,
-          price: input.price,
-          qty: input.qty,
-          ts: input.ts,
-        });
-    } catch (err) {
-      /**
-       * 撮合异常：
-       * 恢复冻结。
-       */
-      this.ledger.unlock(
-        owner,
-        lockAsset,
-        lockAmount,
-      );
-
-      throw err;
-    }
-
-    /**
-     * 3. 每笔成交：
-     *
-     * SQLite trades
-     * +
-     * maker order remaining
-     * +
-     * ledger settlement
-     */
-    for (const fill of result.fills) {
-      this.settleFill(fill);
-
-      saveTrade(fill);
-
-      this.persistMakerAfterFill(fill);
-    }
-
-    /**
-     * 4. taker 剩余订单。
-     */
-    if (result.resting) {
-      saveOrder(result.resting);
-
-      /**
-       * limit buy：
-       * 实际仍需冻结：
-       *
-       * price * remaining
-       *
-       * 如果之前成交价格更低，
-       * 差价已经在 locked 中，
-       * 这里退回。
-       */
-      if (input.side === "buy") {
-        const need =
-          input.type === "limit"
-            ? mulFixed(
-                input.price,
-                result.resting.remaining,
-              )
-            : 0n;
-
-        const refund =
-          lockAmount -
-          this.lockedConsumedByFills(
-            input,
-            result.fills,
-          ) -
-          need;
-
-        /**
-         * 对于 limit buy，
-         * 更简单可靠的计算方式：
-         *
-         * 原始冻结 - 成交实际花费 - 剩余挂单所需冻结
-         */
-        if (refund > 0n) {
-          this.ledger.unlock(
+    private emitPrivateOrderEvent(
+        owner: string,
+        type: PrivateOrderEvent,
+        order: Order,
+        fill?: {
+            price: bigint;
+            qty: bigint;
+        },
+    ): void {
+        this.privateOrderEventHandler?.(
             owner,
-            "USDC",
-            refund,
-          );
-        }
-      }
-
-      /**
-       * sell：
-       * 成交 qty 后 remaining
-       * 自动已经通过 transferLocked
-       * 减少 locked。
-       */
+            type,
+            {
+                order,
+                fill,
+            },
+        );
     }
 
     /**
-     * 5. taker 已经完全成交：
+     * SQLite -> OrderBook
      *
-     * 如果没有 resting：
-     * 剩余冻结全部退回。
-     *
-     * 对 limit buy：
-     * 原冻结金额 - 实际成交金额。
-     *
-     * 对 market buy：
-     * 全部可用 USDC - 实际成交金额。
-     *
-     * 对 sell：
-     * 如果完全成交，剩余 WAVAX 应该为 0。
+     * 这里只恢复 open orders，
+     * 不重新撮合。
      */
-    else {
-      const consumed =
-        input.side === "buy"
-          ? result.fills.reduce(
-              (sum, f) =>
-                sum +
-                mulFixed(
-                  f.price,
-                  f.qty,
-                ),
-              0n,
-            )
-          : result.fills.reduce(
-              (sum, f) =>
-                sum + f.qty,
-              0n,
+    private restoreOrders(): void {
+        const orders = loadOpenOrders();
+
+        for (const order of orders) {
+            this.book.restore(order);
+        }
+
+        console.log(
+            `[db] restored ${orders.length} open orders`,
+        );
+    }
+
+    ordersOf(owner: string): Order[] {
+        return this.book.ordersOf(
+            owner.toLowerCase(),
+        );
+    }
+
+    getOrder(id: string): Order | undefined {
+        return this.book.get(id);
+    }
+
+    /**
+     * 估算 market buy 最少需要多少 USDC。
+     */
+    private estimateBuyCost(qty: bigint): bigint {
+        let cost = 0n;
+        let left = qty;
+
+        const snapshot =
+            this.book.snapshot(
+                Number.MAX_SAFE_INTEGER,
             );
 
-      const refund =
-        lockAmount - consumed;
+        for (const [price, levelQty] of snapshot.asks) {
+            const take =
+                left < levelQty
+                    ? left
+                    : levelQty;
 
-      if (refund > 0n) {
-        this.ledger.unlock(
-          owner,
-          lockAsset,
-          refund,
-        );
-      }
+            cost += mulFixed(
+                price,
+                take,
+            );
+
+            left -= take;
+
+            if (left === 0n) break;
+        }
+
+        return cost;
     }
+    placeOrder(
+        input: PlaceInput,
+        opts: { broadcastBook?: boolean } = {},
+    ) {
+        const owner = input.owner.toLowerCase();
 
-    return result;
-  }
+        const lockAsset =
+            input.side === "buy"
+                ? "USDC"
+                : "WAVAX";
 
-  /**
-   * 计算 taker 已经因为成交消耗掉的冻结资金。
-   */
-  private lockedConsumedByFills(
-    input: PlaceInput,
-    fills: Fill[],
-  ): bigint {
-    if (input.side === "buy") {
-      return fills.reduce(
-        (sum, f) =>
-          sum +
-          mulFixed(
-            f.price,
-            f.qty,
-          ),
-        0n,
-      );
-    }
+        const lockAmount =
+            input.side === "buy"
+                ? input.price * input.qty / 100000000n
+                : input.qty;
 
-    return fills.reduce(
-      (sum, f) =>
-        sum + f.qty,
-      0n,
-    );
-  }
-
-  /**
-   * maker 部分成交：
-   * 更新 remaining。
-   *
-   * maker 完全成交：
-   * 从 SQLite 删除。
-   */
-  private persistMakerAfterFill(
-    fill: Fill,
-  ): void {
-    const maker =
-      this.book.get(
-        fill.makerOrderId,
-      );
-
-    if (maker) {
-      saveOrder(maker);
-    } else {
-      deleteOrder(
-        fill.makerOrderId,
-      );
-    }
-  }
-
-  /**
-   * 成交结算：
-   *
-   * 买方 USDC locked
-   *       ↓
-   * 卖方 USDC available
-   *
-   * 卖方 WAVAX locked
-   *       ↓
-   * 买方 WAVAX available
-   */
-  private settleFill(
-    fill: Fill,
-  ): void {
-    const buyer =
-      fill.side === "buy"
-        ? fill.taker
-        : fill.maker;
-
-    const seller =
-      fill.side === "buy"
-        ? fill.maker
-        : fill.taker;
-
-    const quote =
-      mulFixed(
-        fill.price,
-        fill.qty,
-      );
-
-    this.ledger.transferLocked(
-      buyer,
-      seller,
-      "USDC",
-      quote,
-    );
-
-    this.ledger.transferLocked(
-      seller,
-      buyer,
-      "WAVAX",
-      fill.qty,
-    );
-  }
-
-  cancelOrder(
-    owner: string,
-    id: string,
-  ): Order | null {
-    const normalizedOwner =
-      owner.toLowerCase();
-
-    const order =
-      this.book.cancel(
-        id,
-        normalizedOwner,
-      );
-
-    if (!order) {
-      return null;
-    }
-
-    /**
-     * 只解冻 remaining。
-     */
-    if (order.side === "buy") {
-      const refund =
-        mulFixed(
-          order.price,
-          order.remaining,
+        this.ledger.lock(
+            owner,
+            lockAsset,
+            lockAmount,
         );
 
-      this.ledger.unlock(
-        normalizedOwner,
-        "USDC",
-        refund,
-      );
-    } else {
-      this.ledger.unlock(
-        normalizedOwner,
-        "WAVAX",
-        order.remaining,
-      );
+        let result;
+
+        try {
+            result = this.book.submit({
+                id: input.id,
+                owner,
+                side: input.side,
+                type: input.type,
+                price: input.price,
+                qty: input.qty,
+                ts: input.ts,
+            });
+        } catch (err) {
+            this.ledger.unlock(
+                owner,
+                lockAsset,
+                lockAmount,
+            );
+
+            this.emitPrivateOrderEvent(
+                owner,
+                "order.rejected",
+                {
+                    id: input.id,
+                    owner,
+                    side: input.side,
+                    type: input.type,
+                    price: input.price,
+                    qty: input.qty,
+                    remaining: input.qty,
+                    ts: input.ts ?? Date.now(),
+                    seq: 0,
+                },
+            );
+
+            throw err;
+        }
+
+        /*
+         * 1. 订单接受
+         *
+         * resting 订单直接使用实际订单。
+         * 如果订单立即完全成交，则构造一个
+         * remaining = 0 的订单快照。
+         */
+        const acceptedOrder =
+            result.resting ??
+            {
+                id: input.id,
+                owner,
+                side: input.side,
+                type: input.type,
+                price: input.price,
+                qty: input.qty,
+                remaining: 0n,
+                ts: input.ts ?? Date.now(),
+                seq: 0,
+            };
+
+        this.emitPrivateOrderEvent(
+            owner,
+            "order.accepted",
+            acceptedOrder,
+        );
+
+        /*
+         * 2. 撮合
+         */
+        for (const fill of result.fills) {
+            saveTrade(fill);
+
+            this.persistMakerAfterFill(fill);
+
+            this.settleFill(fill);
+
+            /*
+             * Taker
+             */
+            const takerOrder =
+                this.book.get(fill.takerOrderId);
+
+            const takerRemaining =
+                takerOrder?.remaining ?? 0n;
+
+            const takerSnapshot: Order =
+                takerOrder ??
+                {
+                    id: fill.takerOrderId,
+                    owner: fill.taker,
+                    side: fill.side,
+                    type: "limit",
+                    price: fill.price,
+                    qty: fill.qty,
+                    remaining: 0n,
+                    ts: fill.ts,
+                    seq: 0,
+                };
+
+            this.emitPrivateOrderEvent(
+                fill.taker,
+                takerRemaining === 0n
+                    ? "order.filled"
+                    : "order.partially_filled",
+                takerSnapshot,
+                {
+                    price: fill.price,
+                    qty: fill.qty,
+                },
+            );
+
+            /*
+             * Maker
+             */
+            const makerOrder =
+                this.book.get(fill.makerOrderId);
+
+            const makerRemaining =
+                makerOrder?.remaining ?? 0n;
+
+            const makerSnapshot: Order =
+                makerOrder ??
+                {
+                    id: fill.makerOrderId,
+                    owner: fill.maker,
+                    side:
+                        fill.side === "buy"
+                            ? "sell"
+                            : "buy",
+                    type: "limit",
+                    price: fill.price,
+                    qty: fill.qty,
+                    remaining: 0n,
+                    ts: fill.ts,
+                    seq: 0,
+                };
+
+            this.emitPrivateOrderEvent(
+                fill.maker,
+                makerRemaining === 0n
+                    ? "order.filled"
+                    : "order.partially_filled",
+                makerSnapshot,
+                {
+                    price: fill.price,
+                    qty: fill.qty,
+                },
+            );
+        }
+
+        /*
+         * 3. 剩余订单进入订单簿
+         */
+        if (result.resting) {
+            saveOrder(result.resting);
+        }
+
+        return result;
+    }
+    private persistMakerAfterFill(fill: { makerOrderId: string }): void {
+        const maker = this.book.get(fill.makerOrderId);
+
+        if (maker) {
+            saveOrder(maker);
+        } else {
+            deleteOrder(fill.makerOrderId);
+        }
     }
 
-    deleteOrder(order.id);
+    private settleFill(fill: {
+        taker: string;
+        maker: string;
+        side: Side;
+        price: bigint;
+        qty: bigint;
+    }): void {
+        const buyer =
+            fill.side === "buy"
+                ? fill.taker
+                : fill.maker;
 
-    return order;
-  }
+        const seller =
+            fill.side === "buy"
+                ? fill.maker
+                : fill.taker;
+
+        const quoteAmount =
+            fill.price * fill.qty / 100000000n;
+
+        this.ledger.transferLocked(
+            buyer,
+            seller,
+            "USDC",
+            quoteAmount,
+        );
+
+        this.ledger.transferLocked(
+            seller,
+            buyer,
+            "WAVAX",
+            fill.qty,
+        );
+    }
+    cancelOrder(
+        owner: string,
+        id: string,
+    ): Order | null {
+        const normalizedOwner =
+            owner.toLowerCase();
+
+        const order =
+            this.book.cancel(
+                id,
+                normalizedOwner,
+            );
+
+        if (!order) {
+            return null;
+        }
+
+        /**
+         * 只解冻 remaining。
+         */
+        if (order.side === "buy") {
+            const refund =
+                order.price *
+                order.remaining /
+                100000000n;
+
+            this.ledger.unlock(
+                normalizedOwner,
+                "USDC",
+                refund,
+            );
+        } else {
+            this.ledger.unlock(
+                normalizedOwner,
+                "WAVAX",
+                order.remaining,
+            );
+        }
+
+        deleteOrder(order.id);
+
+        this.emitPrivateOrderEvent(
+            normalizedOwner,
+            "order.cancelled",
+            order,
+        );
+
+        return order;
+    }
 }
