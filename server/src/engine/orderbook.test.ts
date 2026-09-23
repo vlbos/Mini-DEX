@@ -1,14 +1,49 @@
 // 撮合引擎单元测试（vitest）。每个 case 对应一条撮合规则，先看测试再看实现更好懂。
 import { describe, it, expect } from "vitest";
-import { OrderBook, type Side, type OrderType } from "./orderbook.js";
+import {
+  OrderBook,
+  type Side,
+  type OrderType,
+  type TimeInForce,
+} from "./orderbook.js";
 import { parseFixed as F } from "../fixed.js";
 
 let n = 0;
-function order(owner: string, side: Side, type: OrderType, price: string, qty: string) {
-  return { id: `o${++n}`, owner, side, type, price: type === "market" ? 0n : F(price), qty: F(qty) };
+function order(
+  owner: string,
+  side: Side,
+  type: OrderType,
+  price: string,
+  qty: string,
+  timeInForce: TimeInForce = "GTC",
+) {
+  return {
+    id: `o${++n}`,
+    owner,
+    side,
+    type,
+    timeInForce,
+    price: type === "market" ? 0n : F(price),
+    qty: F(qty),
+  };
 }
 const limit = (owner: string, side: Side, price: string, qty: string) => order(owner, side, "limit", price, qty);
 const market = (owner: string, side: Side, qty: string) => order(owner, side, "market", "0", qty);
+const ioc = (
+  owner: string,
+  side: Side,
+  price: string,
+  qty: string,
+) =>
+  order(owner, side, "limit", price, qty, "IOC");
+
+const fok = (
+  owner: string,
+  side: Side,
+  price: string,
+  qty: string,
+) =>
+  order(owner, side, "limit", price, qty, "FOK");
 
 describe("OrderBook", () => {
   it("空簿：limit 单直接挂上", () => {
@@ -184,4 +219,177 @@ describe("OrderBook", () => {
     expect(ob.ordersOf("a").map((o) => o.price).sort((a, b) => (a < b ? -1 : 1))).toEqual([F("90"), F("110")]);
     expect(ob.ordersOf("b")).toHaveLength(1);
   });
+it("IOC：完全成交后不挂单", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("maker", "sell", "100", "2"));
+
+  const r = ob.submit(
+    ioc("taker", "buy", "100", "2"),
+  );
+
+  expect(r.fills).toHaveLength(1);
+  expect(r.fills[0]!.qty).toBe(F("2"));
+  expect(r.resting).toBeNull();
+  expect(ob.bestAsk()).toBeNull();
+  expect(ob.ordersOf("taker")).toHaveLength(0);
+});
+
+it("IOC：部分成交后取消剩余数量", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("maker", "sell", "100", "2"));
+
+  const r = ob.submit(
+    ioc("taker", "buy", "100", "5"),
+  );
+
+  expect(r.fills).toHaveLength(1);
+  expect(r.fills[0]!.qty).toBe(F("2"));
+
+  // 剩余 3 不挂单
+  expect(r.resting).toBeNull();
+  expect(ob.ordersOf("taker")).toHaveLength(0);
+
+  // maker 已经完全成交
+  expect(ob.snapshot()).toEqual({
+    bids: [],
+    asks: [],
+  });
+});
+
+it("IOC：没有流动性时立即取消", () => {
+  const ob = new OrderBook();
+
+  const r = ob.submit(
+    ioc("taker", "buy", "100", "5"),
+  );
+
+  expect(r.fills).toHaveLength(0);
+  expect(r.resting).toBeNull();
+
+  expect(ob.snapshot()).toEqual({
+    bids: [],
+    asks: [],
+  });
+});
+
+it("IOC：价格无法交叉时不挂单", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("maker", "sell", "110", "5"));
+
+  const r = ob.submit(
+    ioc("taker", "buy", "100", "5"),
+  );
+
+  expect(r.fills).toHaveLength(0);
+  expect(r.resting).toBeNull();
+
+  // 原来的卖单仍然存在
+  expect(ob.snapshot()).toEqual({
+    bids: [],
+    asks: [[F("110"), F("5")]],
+  });
+});
+
+it("FOK：流动性足够时全部成交", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("a", "sell", "100", "2"));
+  ob.submit(limit("b", "sell", "101", "3"));
+
+  const r = ob.submit(
+    fok("taker", "buy", "101", "5"),
+  );
+
+  expect(r.fills.map((f) => [f.price, f.qty])).toEqual([
+    [F("100"), F("2")],
+    [F("101"), F("3")],
+  ]);
+
+  expect(r.resting).toBeNull();
+
+  expect(ob.snapshot()).toEqual({
+    bids: [],
+    asks: [],
+  });
+});
+
+it("FOK：流动性不足时完全取消，不产生部分成交", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("maker", "sell", "100", "4"));
+
+  const before = ob.snapshot();
+
+  const r = ob.submit(
+    fok("taker", "buy", "100", "5"),
+  );
+
+  expect(r.fills).toHaveLength(0);
+  expect(r.resting).toBeNull();
+
+  // FOK 失败不能改变订单簿
+  expect(ob.snapshot()).toEqual(before);
+});
+
+it("FOK：可以跨多个价格档位全部成交", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("a", "sell", "100", "2"));
+  ob.submit(limit("b", "sell", "101", "3"));
+
+  const r = ob.submit(
+    fok("taker", "buy", "101", "5"),
+  );
+
+  expect(r.fills.map((f) => [
+    f.price,
+    f.qty,
+  ])).toEqual([
+    [F("100"), F("2")],
+    [F("101"), F("3")],
+  ]);
+
+  expect(r.resting).toBeNull();
+});
+
+it("FOK：失败时订单簿完全不变", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("a", "sell", "100", "2"));
+  ob.submit(limit("b", "sell", "101", "1"));
+
+  const before = ob.snapshot(10);
+
+  const r = ob.submit(
+    fok("taker", "buy", "101", "4"),
+  );
+
+  expect(r.fills).toHaveLength(0);
+  expect(r.resting).toBeNull();
+  expect(ob.snapshot(10)).toEqual(before);
+});
+
+it("FOK：不能使用自己的订单满足全部成交条件", () => {
+  const ob = new OrderBook();
+
+  ob.submit(limit("alice", "sell", "100", "3"));
+  ob.submit(limit("bob", "sell", "100", "1"));
+
+  const r = ob.submit(
+    fok("alice", "buy", "100", "2"),
+  );
+
+  // Alice 自己的 3 不算可成交流动性，
+  // Bob 只有 1，因此 FOK 失败。
+  expect(r.fills).toHaveLength(0);
+  expect(r.resting).toBeNull();
+
+  expect(ob.snapshot()).toEqual({
+    bids: [],
+    asks: [[F("100"), F("4")]],
+  });
+});
 });

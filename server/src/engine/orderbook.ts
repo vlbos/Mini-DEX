@@ -5,12 +5,14 @@
 
 export type Side = "buy" | "sell";
 export type OrderType = "limit" | "market";
+export type TimeInForce = "GTC" | "IOC" | "FOK";
 
 export interface Order {
     id: string;
     owner: string;       // 钱包地址（小写）
     side: Side;
     type: OrderType;
+    timeInForce: TimeInForce;
     price: bigint;       // 8 位定点；market 单为 0n
     qty: bigint;         // 原始数量
     remaining: bigint;   // 还没成交的数量
@@ -44,15 +46,52 @@ export class OrderBook {
     private seq = 0;
 
     /** 提交订单：先吃对手盘，limit 剩余挂单，market 剩余丢弃 */
-    submit(input: Omit<Order, "remaining" | "seq" | "ts"> & Partial<Pick<Order, "ts">>): { fills: Fill[]; resting: Order | null } {
-        const order: Order = { ...input, remaining: input.qty, seq: ++this.seq, ts: input.ts ?? Date.now() };
+    submit(
+        input: Omit<Order, "remaining" | "seq" | "ts"> &
+            Partial<Pick<Order, "ts">>,
+    ): { fills: Fill[]; resting: Order | null } {
+        const order: Order = {
+            ...input,
+            timeInForce: input.timeInForce ?? "GTC",
+            remaining: input.qty,
+            seq: ++this.seq,
+            ts: input.ts ?? Date.now(),
+        };
+
+        // FOK：必须全部成交。
+        // 先检查可成交数量，失败时不执行任何撮合。
+        if (order.timeInForce === "FOK") {
+            const available = this.availableMatchQty(order);
+
+            if (available < order.qty) {
+                return {
+                    fills: [],
+                    resting: null,
+                };
+            }
+        }
+
         const fills = this.match(order);
 
-        if (order.type === "limit" && order.remaining > 0n) {
+        // 只有 GTC limit 单允许剩余部分进入订单簿。
+        if (
+            order.type === "limit" &&
+            order.timeInForce === "GTC" &&
+            order.remaining > 0n
+        ) {
             this.rest(order);
-            return { fills, resting: order };
+            return {
+                fills,
+                resting: order,
+            };
         }
-        return { fills, resting: null }; // market 单不挂；或者 limit 单已全部成交
+
+        // IOC / FOK / market：
+        // 剩余数量不进入订单簿。
+        return {
+            fills,
+            resting: null,
+        };
     }
 
     /** 撤单：只能撤自己的；返回被撤的订单（找不到返回 null） */
@@ -94,6 +133,46 @@ export class OrderBook {
     }
 
     // ---------- 内部实现 ----------
+/**
+ * 计算订单当前最多能够成交多少。
+ *
+ * 注意：
+ * 这里只读订单簿，不修改任何状态。
+ * FOK 必须先确认足够流动性，再真正执行 match()。
+ */
+private availableMatchQty(taker: Order): bigint {
+    let available = 0n;
+
+    const opposite = this.sideOf(
+        taker.side === "buy" ? "sell" : "buy",
+    );
+
+    for (const bestPrice of opposite.prices) {
+        // limit 单遇到无法交叉的价格后，后面的价格也不可能成交。
+        if (
+            taker.type === "limit" &&
+            !this.crosses(taker.side, taker.price, bestPrice)
+        ) {
+            break;
+        }
+
+        const level = opposite.book.get(bestPrice);
+        if (!level) continue;
+
+        for (const maker of level.orders) {
+            // 与现有 match() 保持一致：禁止 self-trade。
+            if (maker.owner === taker.owner) continue;
+
+            available += maker.remaining;
+
+            if (available >= taker.qty) {
+                return taker.qty;
+            }
+        }
+    }
+
+    return available;
+}
     /** 撮合：买单看 asks（从低到高），卖单看 bids（从高到低） */
     private match(taker: Order): Fill[] {
         const fills: Fill[] = [];
@@ -189,23 +268,23 @@ export class OrderBook {
         return side === "buy" ? { book: this.bids, prices: this.bidPrices } : { book: this.asks, prices: this.askPrices };
     }
 
-/**
- * 从 SQLite 恢复一个尚未成交完成的订单。
- *
- * 注意：
- * 这里不能调用 submit()。
- * submit() 会重新执行撮合。
- */
-restore(order: Order): void {
-    if (this.byId.has(order.id)) {
-        return;
+    /**
+     * 从 SQLite 恢复一个尚未成交完成的订单。
+     *
+     * 注意：
+     * 这里不能调用 submit()。
+     * submit() 会重新执行撮合。
+     */
+    restore(order: Order): void {
+        if (this.byId.has(order.id)) {
+            return;
+        }
+
+        this.seq = Math.max(
+            this.seq,
+            order.seq,
+        );
+
+        this.rest(order);
     }
-
-    this.seq = Math.max(
-        this.seq,
-        order.seq,
-    );
-
-    this.rest(order);
-}
 }
