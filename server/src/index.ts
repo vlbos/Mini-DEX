@@ -11,7 +11,7 @@ import { createAuth } from "./auth.js";
 import { createChain } from "./chain.js";
 import { createWs } from "./ws.js";
 import { createRoutes } from "./routes.js";
-import { startMarketMaker } from "./marketmaker.js";
+import { startMarketMaker,type MarketMakerConfig, } from "./marketmaker.js";
 import { parseFixed } from "./fixed.js";
 
 const env = process.env;
@@ -20,14 +20,35 @@ const CHAIN_ID = Number(env.CHAIN_ID ?? 31337);
 const JWT_SECRET = env.JWT_SECRET ?? "dev-secret-change-me";
 // 做市（可选）：MARKET_MAKER=1 开启，把 Binance 盘口镜像到本所订单簿
 const MM_ENABLED = ["1", "true", "on"].includes((env.MARKET_MAKER ?? "").toLowerCase());
-const MM = {
-    address: env.MM_ADDRESS ?? "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720", // 默认 anvil 账户 #9
-    symbol: env.MM_SYMBOL ?? "AVAXUSDT",
-    levels: Number(env.MM_LEVELS ?? 10),
-    scale: Number(env.MM_SCALE ?? 0.05),
-    intervalMs: Number(env.MM_INTERVAL_MS ?? 2000),
-    minQty: Number(env.MM_MIN_QTY ?? 0.1),
-    maxQty: Number(env.MM_MAX_QTY ?? 200),
+const MM: MarketMakerConfig = {
+    address:
+        env.MM_ADDRESS ??
+        "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720",
+
+    // Binance 交易对
+    symbol:
+        env.MM_SYMBOL ??
+        "AVAXUSDT",
+
+    // ★ 作业要求：买 3 档 + 卖 3 档
+    levels:
+        Number(env.MM_LEVELS ?? 3),
+
+    // Binance 数量缩放
+    scale:
+        Number(env.MM_SCALE ?? 0.05),
+
+    // 每 2 秒刷新
+    intervalMs:
+        Number(env.MM_INTERVAL_MS ?? 2000),
+
+    // 单档最小数量
+    minQty:
+        Number(env.MM_MIN_QTY ?? 0.1),
+
+    // 单档最大数量
+    maxQty:
+        Number(env.MM_MAX_QTY ?? 200),
 };
 
 const config = {
@@ -43,6 +64,7 @@ const ledger = new Ledger();
 
 const matching =
     new MatchingService(ledger);
+
 
 const book = matching.book;
 const auth = createAuth({ chainId: CHAIN_ID, jwtSecret: JWT_SECRET });
@@ -87,16 +109,99 @@ const fromBlock = env.DEPOSIT_FROM_BLOCK ? BigInt(env.DEPOSIT_FROM_BLOCK) : unde
 chain.watchDeposits(routes.onDeposit, { fromBlock, onWithdraw: routes.onWithdrawBackfill });
 
 if (MM_ENABLED) {
-    // 虚拟注资：做市账户本身不走链上充值时，用这两项给它账本余额（链上模式下这是"无抵押"的教学用资金，README 有说明）
-    const seedUsdc = env.MM_SEED_USDC ?? "100000";
-    const seedWavax = env.MM_SEED_WAVAX ?? "10000";
-    if (Number(seedUsdc) > 0) ledger.credit(MM.address, "USDC", parseFixed(seedUsdc));
-    if (Number(seedWavax) > 0) ledger.credit(MM.address, "WAVAX", parseFixed(seedWavax));
+    /**
+     * 做市账户初始化资金。
+     *
+     * 仅用于教学/离线做市。
+     *
+     * BUY 需要 USDC
+     * SELL 需要 WAVAX
+     */
+    const seedUsdc =
+        env.MM_SEED_USDC ?? "100000";
+
+    const seedWavax =
+        env.MM_SEED_WAVAX ?? "10000";
+
+    /**
+     * 只有做市账户当前没有余额时才进行虚拟注资。
+     *
+     * 避免 server 重启后重复增加余额。
+     */
+    const mmBalance =
+        ledger.get(MM.address);
+
+    const hasMmBalance =
+        mmBalance.USDC.available !== 0n ||
+        mmBalance.USDC.locked !== 0n ||
+        mmBalance.WAVAX.available !== 0n ||
+        mmBalance.WAVAX.locked !== 0n;
+
+    if (!hasMmBalance) {
+        if (Number(seedUsdc) > 0) {
+            ledger.credit(
+                MM.address,
+                "USDC",
+                parseFixed(seedUsdc),
+            );
+        }
+
+        if (Number(seedWavax) > 0) {
+            ledger.credit(
+                MM.address,
+                "WAVAX",
+                parseFixed(seedWavax),
+            );
+        }
+
+        console.log(
+            `[mm] seed balance: ` +
+            `USDC=${seedUsdc}, ` +
+            `WAVAX=${seedWavax}`,
+        );
+    }
+
+    /**
+     * 启动做市机器人。
+     *
+     * levels=3：
+     *
+     * BUY:
+     *   Binance bid 1
+     *   Binance bid 2
+     *   Binance bid 3
+     *
+     * SELL:
+     *   Binance ask 1
+     *   Binance ask 2
+     *   Binance ask 3
+     *
+     * 总共 6 档。
+     */
+    console.log(
+        `[mm] starting market maker: ` +
+        `${MM.symbol}, ` +
+        `levels=${MM.levels}, ` +
+        `interval=${MM.intervalMs}ms`,
+    );
+
     startMarketMaker(MM, {
         ledger,
-        ordersOf: routes.ordersOf,
-        placeOrder: routes.placeOrder,
-        cancelOrder: routes.cancelOrder,
-        broadcastBook: routes.broadcastBook,
+
+        ordersOf:
+            routes.ordersOf,
+
+        placeOrder:
+            routes.placeOrder,
+
+        cancelOrder:
+            routes.cancelOrder,
+
+        broadcastBook:
+            routes.broadcastBook,
+
+        log:
+            (message) =>
+                console.log(message),
     });
 }

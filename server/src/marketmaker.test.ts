@@ -1,6 +1,7 @@
 // 做市模块的纯函数单测：深度缩放、增量挂撤计划、按余额裁剪、REST 主机故障切换。
 import { describe, expect, it, vi } from "vitest";
-import { capByBalance, fetchDepth, planQuotes, scaleDepth, type Quote } from "./marketmaker.js";
+import { capByBalance, fetchDepth, planQuotes, scaleDepth, type Quote , toQuotes,
+    type Depth, } from "./marketmaker.js";
 import { parseFixed } from "./fixed.js";
 import type { Order } from "./engine/orderbook.js";
 
@@ -108,3 +109,74 @@ describe("fetchDepth", () => {
     expect(String(fetchFn.mock.calls[1][0])).toBe("https://b/api/v3/depth?symbol=AVAXUSDT&limit=5");
   });
 });
+
+
+describe("MarketMaker", () => {
+    it("做市机器人应生成买卖两侧各 3 档", () => {
+        const depth = {
+            bids: [
+                ["100", "10"],
+                ["99", "10"],
+                ["98", "10"],
+                ["97", "10"],
+            ] as [string, string][],
+
+            asks: [
+                ["101", "10"],
+                ["102", "10"],
+                ["103", "10"],
+                ["104", "10"],
+            ] as [string, string][],
+        };
+
+        const options = {
+            levels: 3,
+            scale: 1,
+            minQty: 1,
+            maxQty: 10,
+        };
+
+        const buyLevels = scaleDepth(
+            depth.bids,
+            options,
+        );
+
+        const sellLevels = scaleDepth(
+            depth.asks,
+            options,
+        );
+
+        expect(buyLevels).toHaveLength(3);
+        expect(sellLevels).toHaveLength(3);
+
+        const buys = toQuotes(
+            "buy",
+            buyLevels,
+        );
+
+        const sells = toQuotes(
+            "sell",
+            sellLevels,
+        );
+
+        expect(buys).toHaveLength(3);
+        expect(sells).toHaveLength(3);
+
+        expect(
+            buys.map((q) => q.price),
+        ).toEqual([
+            parseFixed("100"),
+            parseFixed("99"),
+            parseFixed("98"),
+        ]);
+
+        expect(
+            sells.map((q) => q.price),
+        ).toEqual([
+            parseFixed("101"),
+            parseFixed("102"),
+            parseFixed("103"),
+        ]);
+    });
+});
+

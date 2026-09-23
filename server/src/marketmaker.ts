@@ -1,186 +1,698 @@
-// 做市模块：把 Binance 的盘口"镜像"到本所订单簿，让订单簿有真实流动性、用户下单能真的成交。
+// src/marketmaker.ts
 //
-// 每个 tick：拉 Binance 深度 → 取前 N 档并按比例缩小 → 和做市账户现有挂单做增量对比
-//   （价格不在目标里的撤、部分成交偏差大的撤掉重挂、缺的补挂）→ 按可用余额裁剪 → 挂单 → 广播一次订单簿。
-// 做市账户就是账本里的一个普通地址：离线模式靠 MM_SEED_* 虚拟注资；链上模式也可以给它真实 deposit。
-// 教学说明：真实交易所的做市商是独立的外部程序，通过 API 下单；这里为了简单直接跑在后端进程里。
+// 做市机器人：镜像 Binance 前 N 档盘口到本所 OrderBook。
+// 默认配置为买卖两侧各 3 档，共 6 个报价。
+// 每个 tick：
+//   1. 获取 Binance depth
+//   2. 取 bids 前 3 档 + asks 前 3 档
+//   3. 按 scale 缩小数量
+//   4. 与当前做市订单比较
+//   5. 不需要的订单撤掉
+//   6. 缺少的订单重新挂出
+//   7. 根据做市账户 available 余额裁剪
+//   8. 广播一次订单簿
 
 import { ONE, mulFixed, parseFixed } from "./fixed.js";
 import type { Order, Side } from "./engine/orderbook.js";
 import type { Ledger } from "./ledger.js";
 
 export type Level = [price: string, qty: string];
-export interface Depth { bids: Level[]; asks: Level[] }
-export interface Quote { side: Side; price: bigint; qty: bigint }
-export interface Plan { cancel: Order[]; place: Quote[] }
 
-// 和前端同一套主机顺序：*.binance.vision 是官方公共行情域名，stream/api.binance.com 在部分地区返回 451
-export const REST_HOSTS = ["https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com"];
-
-type FetchLike = (input: string) => Promise<{ ok: boolean; status?: number; json: () => Promise<unknown> }>;
-export interface RestOptions { hosts?: string[]; fetchFn?: FetchLike }
-
-export async function fetchDepth(symbol: string, limit = 20, opts: RestOptions = {}): Promise<Depth> {
-  const hosts = opts.hosts ?? REST_HOSTS;
-  const fetchFn: FetchLike = opts.fetchFn ?? ((u) => fetch(u));
-  let lastErr: unknown = new Error("no hosts");
-  for (const host of hosts) {
-    try {
-      const res = await fetchFn(`${host}/api/v3/depth?symbol=${symbol}&limit=${limit}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status ?? "?"} from ${host}`);
-      const d = (await res.json()) as { bids: Level[]; asks: Level[] };
-      return { bids: d.bids, asks: d.asks };
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr;
+export interface Depth {
+    bids: Level[];
+    asks: Level[];
 }
 
-export interface ScaleOptions { levels: number; scale: number; minQty: number; maxQty: number }
+export interface Quote {
+    side: Side;
+    price: bigint;
+    qty: bigint;
+}
 
-/** Binance 深度 → 本所目标档位：取前 levels 档，数量 × scale 后夹在 [minQty, maxQty]，价格 / 数量保留 4 位小数 */
-export function scaleDepth(levels: Level[], o: ScaleOptions): Level[] {
-  return levels.slice(0, o.levels).map(([p, q]) => {
-    const qty = Math.min(o.maxQty, Math.max(o.minQty, Number(q) * o.scale));
-    return [trim4(Number(p)), trim4(qty)];
-  });
+export interface Plan {
+    cancel: Order[];
+    place: Quote[];
+}
+
+/**
+ * Binance 公共行情 API。
+ */
+export const REST_HOSTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+];
+
+type FetchLike = (
+    input: string,
+) => Promise<{
+    ok: boolean;
+    status?: number;
+    json: () => Promise<unknown>;
+}>;
+
+export interface RestOptions {
+    hosts?: string[];
+    fetchFn?: FetchLike;
+}
+
+/**
+ * 获取 Binance OrderBook depth。
+ */
+export async function fetchDepth(
+    symbol: string,
+    limit = 20,
+    opts: RestOptions = {},
+): Promise<Depth> {
+    const hosts = opts.hosts ?? REST_HOSTS;
+
+    const fetchFn: FetchLike =
+        opts.fetchFn ??
+        ((url) => fetch(url));
+
+    let lastErr: unknown =
+        new Error("no Binance hosts available");
+
+    for (const host of hosts) {
+        try {
+            const url =
+                `${host}/api/v3/depth` +
+                `?symbol=${encodeURIComponent(symbol)}` +
+                `&limit=${limit}`;
+
+            const res = await fetchFn(url);
+
+            if (!res.ok) {
+                throw new Error(
+                    `HTTP ${res.status ?? "?"} from ${host}`,
+                );
+            }
+
+            const data =
+                (await res.json()) as {
+                    bids: Level[];
+                    asks: Level[];
+                };
+
+            return {
+                bids: data.bids,
+                asks: data.asks,
+            };
+        } catch (err) {
+            lastErr = err;
+        }
+    }
+
+    throw lastErr;
+}
+
+/**
+ * 做市配置。
+ *
+ * levels = 3：
+ *   bids 取 3 档
+ *   asks 取 3 档
+ *   总共 6 档
+ */
+export interface ScaleOptions {
+    levels: number;
+    scale: number;
+    minQty: number;
+    maxQty: number;
+}
+
+/**
+ * Binance depth -> 本所目标报价。
+ */
+export function scaleDepth(
+    levels: Level[],
+    options: ScaleOptions,
+): Level[] {
+    return levels
+        .slice(0, options.levels)
+        .map(([price, qty]) => {
+            const scaledQty = Math.min(
+                options.maxQty,
+                Math.max(
+                    options.minQty,
+                    Number(qty) * options.scale,
+                ),
+            );
+
+            return [
+                trim4(Number(price)),
+                trim4(scaledQty),
+            ];
+        });
 }
 
 function trim4(n: number): string {
-  return n.toFixed(4).replace(/\.?0+$/, "");
+    return n
+        .toFixed(4)
+        .replace(/\.?0+$/, "");
 }
 
-export function toQuotes(side: Side, levels: Level[]): Quote[] {
-  return levels.map(([p, q]) => ({ side, price: parseFixed(p), qty: parseFixed(q) }));
+/**
+ * Binance Level -> 定点数 Quote。
+ */
+export function toQuotes(
+    side: Side,
+    levels: Level[],
+): Quote[] {
+    return levels.map(([price, qty]) => ({
+        side,
+        price: parseFixed(price),
+        qty: parseFixed(qty),
+    }));
 }
 
-/** 增量计划：已有单按 (side, price) 和目标匹配；不在目标里 → 撤；剩余量偏差超过 tolerance → 撤并重挂；同价重复只留一张 */
-export function planQuotes(targets: Quote[], existing: Order[], tolerance = 0.2): Plan {
-  const key = (side: Side, price: bigint) => `${side}:${price}`;
-  const want = new Map(targets.map((t) => [key(t.side, t.price), t]));
-  const matched = new Set<string>();
-  const cancel: Order[] = [];
+/**
+ * 根据目标报价和现有订单生成增量计划。
+ *
+ * 规则：
+ *
+ * 1. 目标中不存在的旧订单 -> cancel
+ * 2. 同价重复订单 -> cancel 多余订单
+ * 3. 数量偏差超过 tolerance -> cancel + 重挂
+ * 4. 已经满足要求 -> 保留
+ * 5. 目标中不存在的价格 -> place
+ */
+export function planQuotes(
+    targets: Quote[],
+    existing: Order[],
+    tolerance = 0.2,
+): Plan {
+    const key = (
+        side: Side,
+        price: bigint,
+    ) => `${side}:${price}`;
 
-  for (const o of existing) {
-    const k = key(o.side, o.price);
-    const t = want.get(k);
-    if (!t || matched.has(k)) {
-      cancel.push(o); // 目标里没有这个价，或同价已有一张
-      continue;
+    const wanted = new Map(
+        targets.map((target) => [
+            key(target.side, target.price),
+            target,
+        ]),
+    );
+
+    const matched = new Set<string>();
+
+    const cancel: Order[] = [];
+
+    for (const order of existing) {
+        const k = key(
+            order.side,
+            order.price,
+        );
+
+        const target = wanted.get(k);
+
+        if (!target || matched.has(k)) {
+            cancel.push(order);
+            continue;
+        }
+
+        const diff =
+            order.remaining > target.qty
+                ? order.remaining - target.qty
+                : target.qty - order.remaining;
+
+        if (
+            Number(diff) >
+            Number(target.qty) * tolerance
+        ) {
+            cancel.push(order);
+            continue;
+        }
+
+        matched.add(k);
     }
-    const diff = o.remaining > t.qty ? o.remaining - t.qty : t.qty - o.remaining;
-    if (Number(diff) > Number(t.qty) * tolerance) {
-      cancel.push(o); // 部分成交太多，撤掉重挂补足
-      continue;
-    }
-    matched.add(k);
-  }
 
-  const place = targets.filter((t) => !matched.has(key(t.side, t.price)));
-  return { cancel, place };
+    const place = targets.filter(
+        (target) =>
+            !matched.has(
+                key(target.side, target.price),
+            ),
+    );
+
+    return {
+        cancel,
+        place,
+    };
 }
 
-/** 按可用余额裁剪：买单从最优价往外累计 USDC 成本，卖单累计 WAVAX 数量；不够的截断，太小的丢弃 */
-export function capByBalance(quotes: Quote[], avail: { USDC: bigint; WAVAX: bigint }, minQty: bigint): Quote[] {
-  let usdc = avail.USDC;
-  let wavax = avail.WAVAX;
-  const out: Quote[] = [];
-  for (const q of quotes) {
-    if (q.side === "buy") {
-      const cost = mulFixed(q.price, q.qty);
-      let qty = q.qty;
-      if (cost > usdc) qty = floor4((usdc * ONE) / q.price); // 买得起多少就挂多少
-      if (qty < minQty || qty <= 0n) continue;
-      usdc -= mulFixed(q.price, qty);
-      out.push({ ...q, qty });
-    } else {
-      const qty = q.qty > wavax ? wavax : q.qty;
-      if (qty < minQty || qty <= 0n) continue;
-      wavax -= qty;
-      out.push({ ...q, qty });
+/**
+ * 根据做市账户 available 余额裁剪报价。
+ *
+ * BUY：
+ *   使用 USDC
+ *
+ * SELL：
+ *   使用 WAVAX
+ */
+export function capByBalance(
+    quotes: Quote[],
+    avail: {
+        USDC: bigint;
+        WAVAX: bigint;
+    },
+    minQty: bigint,
+): Quote[] {
+    let usdc = avail.USDC;
+    let wavax = avail.WAVAX;
+
+    const result: Quote[] = [];
+
+    for (const quote of quotes) {
+        if (quote.side === "buy") {
+            const cost = mulFixed(
+                quote.price,
+                quote.qty,
+            );
+
+            let qty = quote.qty;
+
+            if (cost > usdc) {
+                qty = floor4(
+                    (usdc * ONE) /
+                    quote.price,
+                );
+            }
+
+            if (
+                qty < minQty ||
+                qty <= 0n
+            ) {
+                continue;
+            }
+
+            usdc -= mulFixed(
+                quote.price,
+                qty,
+            );
+
+            result.push({
+                ...quote,
+                qty,
+            });
+        } else {
+            let qty = quote.qty;
+
+            if (qty > wavax) {
+                qty = wavax;
+            }
+
+            if (
+                qty < minQty ||
+                qty <= 0n
+            ) {
+                continue;
+            }
+
+            wavax -= qty;
+
+            result.push({
+                ...quote,
+                qty,
+            });
+        }
     }
-  }
-  return out;
+
+    return result;
 }
 
-// 定点数截到 4 位小数（8 位定点 → 去掉低 4 位）
-function floor4(v: bigint): bigint {
-  const unit = 10n ** 4n;
-  return (v / unit) * unit;
+/**
+ * 8 位定点数截断到 4 位小数。
+ */
+function floor4(value: bigint): bigint {
+    const unit = 10n ** 4n;
+
+    return (
+        value / unit
+    ) * unit;
 }
 
 export interface MarketMakerConfig {
-  address: string;
-  symbol: string;
-  levels: number;
-  scale: number;
-  intervalMs: number;
-  minQty: number;
-  maxQty: number;
-}
+    /**
+     * 做市账户地址。
+     */
+    address: string;
 
+    /**
+     * Binance 交易对。
+     * 例如 WAVAXUSDC。
+     */
+    symbol: string;
+
+    /**
+     * 买卖两侧档数。
+     *
+     * 作业要求：
+     * levels = 3
+     */
+    levels: number;
+
+    /**
+     * Binance 数量缩放比例。
+     */
+    scale: number;
+
+    /**
+     * 刷新间隔。
+     */
+    intervalMs: number;
+
+    /**
+     * 单档最小数量。
+     */
+    minQty: number;
+
+    /**
+     * 单档最大数量。
+     */
+    maxQty: number;
+}
 export interface MarketMakerDeps {
-  ledger: Ledger;
-  ordersOf(owner: string): Order[];
-  placeOrder(owner: string, q: { side: Side; type: "limit"; price: bigint; qty: bigint }, opts: { broadcastBook: boolean }): unknown;
-  cancelOrder(owner: string, id: string, opts: { broadcastBook: boolean }): unknown;
-  broadcastBook(): void;
-  fetchDepth?: typeof fetchDepth;
-  log?: (msg: string) => void;
+    ledger: Ledger;
+
+    ordersOf(
+        owner: string,
+    ): Order[];
+
+    placeOrder(
+        owner: string,
+        q: {
+            side: Side;
+            type: "limit";
+            price: bigint;
+            qty: bigint;
+        },
+        opts: {
+            broadcastBook: boolean;
+        },
+    ): unknown;
+
+    cancelOrder(
+        owner: string,
+        id: string,
+        opts?: {
+            broadcastBook?: boolean;
+        },
+    ): unknown;
+
+    broadcastBook(): void;
+
+    fetchDepth?: typeof fetchDepth;
+
+    log?: (msg: string) => void;
 }
 
-/** 启动做市循环，返回停止函数 */
-export function startMarketMaker(cfg: MarketMakerConfig, deps: MarketMakerDeps): () => void {
-  const log = deps.log ?? ((m: string) => console.log(`[mm] ${m}`));
-  const getDepth = deps.fetchDepth ?? fetchDepth;
-  const mm = cfg.address.toLowerCase();
-  const minQtyFixed = parseFixed(String(cfg.minQty));
-  let running = false;
-  let failures = 0;
-  let ticks = 0;
+/**
+ * 启动做市机器人。
+ *
+ * 返回 stop 函数。
+ */
+export function startMarketMaker(
+    cfg: MarketMakerConfig,
+    deps: MarketMakerDeps,
+): () => void {
+    const log =
+        deps.log ??
+        ((message: string) =>
+            console.log(`[mm] ${message}`));
 
-  async function tick() {
-    if (running) return; // 上一个 tick 还没跑完（网络慢）就跳过这一轮
-    running = true;
-    try {
-      const depth = await getDepth(cfg.symbol, Math.max(cfg.levels, 5));
-      const scaleOpts = { levels: cfg.levels, scale: cfg.scale, minQty: cfg.minQty, maxQty: cfg.maxQty };
-      const targets = [...toQuotes("buy", scaleDepth(depth.bids, scaleOpts)), ...toQuotes("sell", scaleDepth(depth.asks, scaleOpts))];
+    const getDepth =
+        deps.fetchDepth ??
+        fetchDepth;
 
-      const plan = planQuotes(targets, deps.ordersOf(mm));
-      for (const o of plan.cancel) deps.cancelOrder(mm, o.id, { broadcastBook: false });
+    const mm =
+        cfg.address.toLowerCase();
 
-      const b = deps.ledger.get(mm);
-      const toPlace = capByBalance(plan.place, { USDC: b.USDC.available, WAVAX: b.WAVAX.available }, minQtyFixed);
-      let placed = 0;
-      for (const q of toPlace) {
-        try {
-          deps.placeOrder(mm, { side: q.side, type: "limit", price: q.price, qty: q.qty }, { broadcastBook: false });
-          placed += 1;
-        } catch (e) {
-          log(`挂单失败 ${q.side} ${q.price}: ${(e as Error).message}`);
+    const minQtyFixed =
+        parseFixed(
+            String(cfg.minQty),
+        );
+
+    let running = false;
+    let failures = 0;
+    let ticks = 0;
+
+    /**
+     * 单次做市刷新。
+     */
+    async function tick(): Promise<void> {
+        // 防止上一次请求还没有结束，
+        // 下一次 tick 又开始执行。
+        if (running) {
+            return;
         }
-      }
-      if (plan.cancel.length || placed) deps.broadcastBook();
 
-      ticks += 1;
-      if (failures > 0) log(`行情恢复，继续做市`);
-      failures = 0;
-      if (ticks === 1 || ticks % 150 === 0) {
-        const s = deps.ordersOf(mm);
-        log(`tick#${ticks} 簿上 ${s.filter((o) => o.side === "buy").length} 买 / ${s.filter((o) => o.side === "sell").length} 卖，本轮撤 ${plan.cancel.length} 挂 ${placed}`);
-      }
-    } catch (e) {
-      failures += 1;
-      if (failures === 1 || failures % 30 === 0) log(`拉取 Binance 深度失败（连续 ${failures} 次）：${(e as Error).message}`);
-    } finally {
-      running = false;
+        running = true;
+
+        try {
+            /**
+             * 1. 获取 Binance 深度。
+             *
+             * 多取几档，确保至少有 3 档。
+             */
+            const depth =
+                await getDepth(
+                    cfg.symbol,
+                    Math.max(
+                        cfg.levels,
+                        5,
+                    ),
+                );
+
+            /**
+             * 2. 生成目标报价。
+             *
+             * levels = 3 时：
+             *
+             * bids -> 3
+             * asks -> 3
+             */
+            const scaleOptions = {
+                levels: cfg.levels,
+                scale: cfg.scale,
+                minQty: cfg.minQty,
+                maxQty: cfg.maxQty,
+            };
+
+            const buyLevels =
+                scaleDepth(
+                    depth.bids,
+                    scaleOptions,
+                );
+
+            const sellLevels =
+                scaleDepth(
+                    depth.asks,
+                    scaleOptions,
+                );
+
+            const targets = [
+                ...toQuotes(
+                    "buy",
+                    buyLevels,
+                ),
+                ...toQuotes(
+                    "sell",
+                    sellLevels,
+                ),
+            ];
+
+            /**
+             * 3. 和当前做市订单比较。
+             */
+            const existing =
+                deps.ordersOf(mm);
+
+            const plan =
+                planQuotes(
+                    targets,
+                    existing,
+                );
+
+            /**
+             * 4. 撤掉过期订单。
+             */
+            for (const order of plan.cancel) {
+                try {
+                    deps.cancelOrder(
+                        mm,
+                        order.id, {
+                        broadcastBook: false,
+                    },
+                    );
+                } catch (err) {
+                    log(
+                        `撤单失败 ${order.id}: ` +
+                        `${(err as Error).message}`,
+                    );
+                }
+            }
+
+            /**
+             * 5. 读取做市账户余额。
+             */
+            const balance =
+                deps.ledger.get(mm);
+
+            /**
+             * 6. 根据余额裁剪要挂的订单。
+             */
+            const toPlace =
+                capByBalance(
+                    plan.place,
+                    {
+                        USDC:
+                            balance.USDC.available,
+                        WAVAX:
+                            balance.WAVAX.available,
+                    },
+                    minQtyFixed,
+                );
+
+            /**
+             * 7. 逐笔挂单。
+             */
+            let placed = 0;
+
+            for (const quote of toPlace) {
+                try {
+                    deps.placeOrder(
+                        mm,
+                        {
+                            side: quote.side,
+                            type: "limit",
+                            price: quote.price,
+                            qty: quote.qty,
+                        },
+                        {
+                            broadcastBook: false,
+                        },
+                    );
+
+                    placed += 1;
+                } catch (err) {
+                    log(
+                        `挂单失败 ` +
+                        `${quote.side} ` +
+                        `${quote.price}: ` +
+                        `${(err as Error).message}`,
+                    );
+                }
+            }
+
+            /**
+             * 8. 所有修改完成后只广播一次。
+             */
+            if (
+                plan.cancel.length > 0 ||
+                placed > 0
+            ) {
+                deps.broadcastBook();
+            }
+
+            ticks += 1;
+
+            if (failures > 0) {
+                log(
+                    "Binance 行情恢复，继续做市",
+                );
+            }
+
+            failures = 0;
+
+            /**
+             * 定期输出做市状态。
+             */
+            if (
+                ticks === 1 ||
+                ticks % 30 === 0
+            ) {
+                const orders =
+                    deps.ordersOf(mm);
+
+                const buys =
+                    orders.filter(
+                        (o) =>
+                            o.side === "buy",
+                    );
+
+                const sells =
+                    orders.filter(
+                        (o) =>
+                            o.side === "sell",
+                    );
+
+                log(
+                    `tick#${ticks} ` +
+                    `买 ${buys.length}/${cfg.levels} 档 ` +
+                    `卖 ${sells.length}/${cfg.levels} 档 ` +
+                    `撤 ${plan.cancel.length} ` +
+                    `挂 ${placed}`,
+                );
+
+                for (const order of buys) {
+                    log(
+                        `  BUY  ${order.price} ` +
+                        `qty=${order.remaining}`,
+                    );
+                }
+
+                for (const order of sells) {
+                    log(
+                        `  SELL ${order.price} ` +
+                        `qty=${order.remaining}`,
+                    );
+                }
+            }
+        } catch (err) {
+            failures += 1;
+
+            if (
+                failures === 1 ||
+                failures % 30 === 0
+            ) {
+                log(
+                    `拉取 Binance 深度失败 ` +
+                    `（连续 ${failures} 次）：` +
+                    `${(err as Error).message}`,
+                );
+            }
+        } finally {
+            running = false;
+        }
     }
-  }
 
-  log(`启动：账户 ${mm}，镜像 Binance ${cfg.symbol} 前 ${cfg.levels} 档 × ${cfg.scale}，每 ${cfg.intervalMs}ms 刷新`);
-  void tick();
-  const timer = setInterval(() => void tick(), cfg.intervalMs);
-  return () => clearInterval(timer);
+    log(
+        `启动：账户 ${mm}，` +
+        `镜像 Binance ${cfg.symbol} ` +
+        `前 ${cfg.levels} 档 × ${cfg.scale}，` +
+        `每 ${cfg.intervalMs}ms 刷新`,
+    );
+
+    /**
+     * 立即执行第一次。
+     */
+    void tick();
+
+    /**
+     * 周期刷新。
+     */
+    const timer =
+        setInterval(
+            () => void tick(),
+            cfg.intervalMs,
+        );
+
+    /**
+     * 停止做市。
+     */
+    return () => {
+        clearInterval(timer);
+
+        log("做市机器人已停止");
+    };
 }
